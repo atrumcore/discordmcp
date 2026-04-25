@@ -191,6 +191,15 @@ const ReadForumPostSchema = z.object({
   limit: z.number().min(1).max(100).default(50),
 });
 
+const EditForumPostSchema = z.object({
+  server: z.string().optional().describe('Server name or ID (optional if bot is only in one server)'),
+  thread_id: z.string().describe('Forum post/thread ID'),
+  title: z.string().optional().describe('New title for the forum post'),
+  archived: z.boolean().optional().describe('Set archived state'),
+  locked: z.boolean().optional().describe('Set locked state'),
+  tags: z.array(z.string()).optional().describe('Tag names to apply (replaces existing tags)'),
+});
+
 // Create server instance
 const server = new Server(
   {
@@ -299,6 +308,41 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "number",
               description: "Number of messages to fetch (max 100)",
               default: 50,
+            },
+          },
+          required: ["thread_id"],
+        },
+      },
+      {
+        name: "edit-forum-post",
+        description: "Edit a Discord forum post's title, archived/locked state, or tags",
+        inputSchema: {
+          type: "object",
+          properties: {
+            server: {
+              type: "string",
+              description: 'Server name or ID (optional if bot is only in one server)',
+            },
+            thread_id: {
+              type: "string",
+              description: "Forum post/thread ID",
+            },
+            title: {
+              type: "string",
+              description: "New title for the forum post",
+            },
+            archived: {
+              type: "boolean",
+              description: "Set archived state",
+            },
+            locked: {
+              type: "boolean",
+              description: "Set locked state",
+            },
+            tags: {
+              type: "array",
+              items: { type: "string" },
+              description: "Tag names to apply (replaces existing tags)",
             },
           },
           required: ["thread_id"],
@@ -470,6 +514,46 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               server: thread.guild.name,
               messages: formattedMessages,
             }, null, 2),
+          }],
+        };
+      }
+
+      case "edit-forum-post": {
+        const { thread_id, server: srv, title, archived, locked, tags } = EditForumPostSchema.parse(args);
+        const guild = await findGuild(srv);
+
+        const thread = await client.channels.fetch(thread_id);
+        if (!thread || !thread.isThread()) {
+          throw new Error(`Thread "${thread_id}" not found or is not a thread/forum post`);
+        }
+        if (thread.guild?.id !== guild.id) {
+          throw new Error(`Thread "${thread_id}" does not belong to server "${guild.name}"`);
+        }
+
+        const editOptions: Record<string, unknown> = {};
+        if (title !== undefined) editOptions.name = title;
+        if (archived !== undefined) editOptions.archived = archived;
+        if (locked !== undefined) editOptions.locked = locked;
+        if (tags !== undefined && thread.parent && thread.parent.type === ChannelType.GuildForum) {
+          const forum = thread.parent as ForumChannel;
+          const tagIds = tags.map(tagName => {
+            const found = forum.availableTags.find(t => t.name.toLowerCase() === tagName.toLowerCase());
+            if (!found) throw new Error(`Tag "${tagName}" not found. Available: ${forum.availableTags.map(t => t.name).join(', ')}`);
+            return found.id;
+          });
+          editOptions.appliedTags = tagIds;
+        }
+
+        if (Object.keys(editOptions).length === 0) {
+          throw new Error('No changes specified — provide at least one of: title, archived, locked, tags');
+        }
+
+        await thread.edit(editOptions);
+
+        return {
+          content: [{
+            type: "text",
+            text: `Forum post "${thread.name}" updated successfully in ${thread.guild.name}.`,
           }],
         };
       }
