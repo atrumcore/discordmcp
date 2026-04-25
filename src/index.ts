@@ -5,7 +5,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { Client, GatewayIntentBits, TextChannel } from 'discord.js';
+import { Client, GatewayIntentBits, TextChannel, ForumChannel, ChannelType, ThreadChannel, AnyThreadChannel } from 'discord.js';
 import { z } from 'zod';
 
 // Load environment variables
@@ -91,6 +91,80 @@ async function findChannel(channelIdentifier: string, guildIdentifier?: string):
   throw new Error(`Channel "${channelIdentifier}" is not a text channel or not found in server "${guild.name}"`);
 }
 
+// Helper to find a forum channel by name or ID
+async function findForumChannel(channelIdentifier: string, guildIdentifier?: string): Promise<ForumChannel> {
+  const guild = await findGuild(guildIdentifier);
+
+  // Try fetch by ID
+  try {
+    const channel = await client.channels.fetch(channelIdentifier);
+    if (channel && channel.type === ChannelType.GuildForum && 'guild' in channel && (channel as ForumChannel).guild.id === guild.id) {
+      return channel as ForumChannel;
+    }
+  } catch {
+    // fall through to name search
+  }
+
+  const forums = guild.channels.cache.filter(
+    (c): c is ForumChannel =>
+      c.type === ChannelType.GuildForum &&
+      (c.name.toLowerCase() === channelIdentifier.toLowerCase() ||
+       c.name.toLowerCase() === channelIdentifier.toLowerCase().replace('#', ''))
+  );
+
+  if (forums.size === 0) {
+    const availableForums = guild.channels.cache
+      .filter(c => c.type === ChannelType.GuildForum)
+      .map(c => `"#${c.name}" (${c.id})`).join(', ');
+    throw new Error(`Forum channel "${channelIdentifier}" not found in server "${guild.name}". Available forum channels: ${availableForums || 'none'}`);
+  }
+  if (forums.size > 1) {
+    const forumList = forums.map(c => `#${c.name} (${c.id})`).join(', ');
+    throw new Error(`Multiple forum channels found: ${forumList}. Please specify the channel ID.`);
+  }
+  return forums.first()!;
+}
+
+// Helper to find any readable channel (text channel or thread)
+async function findReadableChannel(channelIdentifier: string, guildIdentifier?: string): Promise<TextChannel | AnyThreadChannel> {
+  const guild = await findGuild(guildIdentifier);
+
+  // Try fetch by ID — works for text channels AND threads (forum posts)
+  try {
+    const channel = await client.channels.fetch(channelIdentifier);
+    if (channel) {
+      if (channel instanceof TextChannel && channel.guild.id === guild.id) {
+        return channel;
+      }
+      if (channel.isThread() && channel.guild?.id === guild.id) {
+        return channel;
+      }
+    }
+  } catch {
+    // fall through to name search
+  }
+
+  // Name search only works for text channels (threads don't have unique names)
+  const channels = guild.channels.cache.filter(
+    (channel): channel is TextChannel =>
+      channel instanceof TextChannel &&
+      (channel.name.toLowerCase() === channelIdentifier.toLowerCase() ||
+       channel.name.toLowerCase() === channelIdentifier.toLowerCase().replace('#', ''))
+  );
+
+  if (channels.size === 0) {
+    const availableChannels = guild.channels.cache
+      .filter((c): c is TextChannel => c instanceof TextChannel)
+      .map(c => `"#${c.name}"`).join(', ');
+    throw new Error(`Channel "${channelIdentifier}" not found in server "${guild.name}". Available channels: ${availableChannels}. For forum posts, use the thread/post ID.`);
+  }
+  if (channels.size > 1) {
+    const channelList = channels.map(c => `#${c.name} (${c.id})`).join(', ');
+    throw new Error(`Multiple channels found: ${channelList}. Please specify the channel ID.`);
+  }
+  return channels.first()!;
+}
+
 // Updated validation schemas
 const SendMessageSchema = z.object({
   server: z.string().optional().describe('Server name or ID (optional if bot is only in one server)'),
@@ -100,7 +174,20 @@ const SendMessageSchema = z.object({
 
 const ReadMessagesSchema = z.object({
   server: z.string().optional().describe('Server name or ID (optional if bot is only in one server)'),
-  channel: z.string().describe('Channel name (e.g., "general") or ID'),
+  channel: z.string().describe('Channel name (e.g., "general") or channel/thread ID'),
+  limit: z.number().min(1).max(100).default(50),
+});
+
+const ListForumPostsSchema = z.object({
+  server: z.string().optional().describe('Server name or ID (optional if bot is only in one server)'),
+  channel: z.string().describe('Forum channel name (e.g., "bug-reports") or ID'),
+  limit: z.number().min(1).max(25).default(10),
+  include_archived: z.boolean().default(true).describe('Include archived/closed posts'),
+});
+
+const ReadForumPostSchema = z.object({
+  server: z.string().optional().describe('Server name or ID (optional if bot is only in one server)'),
+  thread_id: z.string().describe('Forum post/thread ID'),
   limit: z.number().min(1).max(100).default(50),
 });
 
@@ -166,6 +253,57 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           required: ["channel"],
         },
       },
+      {
+        name: "list-forum-posts",
+        description: "List recent posts/threads in a Discord forum channel",
+        inputSchema: {
+          type: "object",
+          properties: {
+            server: {
+              type: "string",
+              description: 'Server name or ID (optional if bot is only in one server)',
+            },
+            channel: {
+              type: "string",
+              description: 'Forum channel name (e.g., "bug-reports") or ID',
+            },
+            limit: {
+              type: "number",
+              description: "Number of posts to return (max 25)",
+              default: 10,
+            },
+            include_archived: {
+              type: "boolean",
+              description: "Include archived/closed posts (default true)",
+              default: true,
+            },
+          },
+          required: ["channel"],
+        },
+      },
+      {
+        name: "read-forum-post",
+        description: "Read all messages in a Discord forum post/thread",
+        inputSchema: {
+          type: "object",
+          properties: {
+            server: {
+              type: "string",
+              description: 'Server name or ID (optional if bot is only in one server)',
+            },
+            thread_id: {
+              type: "string",
+              description: "Forum post/thread ID",
+            },
+            limit: {
+              type: "number",
+              description: "Number of messages to fetch (max 100)",
+              default: 50,
+            },
+          },
+          required: ["thread_id"],
+        },
+      },
     ],
   };
 });
@@ -177,9 +315,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
     switch (name) {
       case "send-message": {
-        const { channel: channelIdentifier, message } = SendMessageSchema.parse(args);
-        const channel = await findChannel(channelIdentifier);
-        
+        const { channel: channelIdentifier, message, server: srv } = SendMessageSchema.parse(args);
+        const channel = await findReadableChannel(channelIdentifier, srv);
+
         const sent = await channel.send(message);
         return {
           content: [{
@@ -190,9 +328,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "read-messages": {
-        const { channel: channelIdentifier, limit } = ReadMessagesSchema.parse(args);
-        const channel = await findChannel(channelIdentifier);
-        
+        const { channel: channelIdentifier, server: srv, limit } = ReadMessagesSchema.parse(args);
+        const channel = await findReadableChannel(channelIdentifier, srv);
+
         const messages = await channel.messages.fetch({ limit });
         const formattedMessages = Array.from(messages.values()).map(msg => ({
           channel: `#${channel.name}`,
@@ -200,12 +338,138 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           author: msg.author.tag,
           content: msg.content,
           timestamp: msg.createdAt.toISOString(),
+          ...(msg.embeds.length > 0 && {
+            embeds: msg.embeds.map(e => ({
+              ...(e.title && { title: e.title }),
+              ...(e.description && { description: e.description }),
+              ...(e.fields.length > 0 && { fields: e.fields.map(f => ({ name: f.name, value: f.value })) }),
+            })),
+          }),
+          ...(msg.attachments.size > 0 && {
+            attachments: Array.from(msg.attachments.values()).map(a => a.url),
+          }),
         }));
 
         return {
           content: [{
             type: "text",
             text: JSON.stringify(formattedMessages, null, 2),
+          }],
+        };
+      }
+
+      case "list-forum-posts": {
+        const { channel: channelIdentifier, server: srv, limit, include_archived } = ListForumPostsSchema.parse(args);
+        const forum = await findForumChannel(channelIdentifier, srv);
+
+        const allThreads: AnyThreadChannel[] = [];
+
+        // Fetch active threads
+        const { threads: activeThreads } = await forum.threads.fetchActive();
+        for (const thread of activeThreads.values()) {
+          if (thread.parentId === forum.id) allThreads.push(thread);
+        }
+
+        // Fetch archived threads if requested
+        if (include_archived) {
+          const archived = await forum.threads.fetchArchived({ type: 'public', limit: 100 });
+          for (const thread of archived.threads.values()) {
+            if (!allThreads.some(t => t.id === thread.id)) {
+              allThreads.push(thread);
+            }
+          }
+        }
+
+        // Sort by creation date descending, take limit
+        allThreads.sort((a, b) => (b.createdTimestamp ?? 0) - (a.createdTimestamp ?? 0));
+        const posts = allThreads.slice(0, limit);
+
+        const formattedPosts = await Promise.all(posts.map(async (thread) => {
+          // Fetch the first message (the "post body")
+          const starter = await thread.fetchStarterMessage().catch(() => null);
+          const tags = thread.appliedTags.map(tagId => {
+            const tag = forum.availableTags.find(t => t.id === tagId);
+            return tag ? tag.name : tagId;
+          });
+
+          return {
+            id: thread.id,
+            title: thread.name,
+            author: starter?.author?.tag ?? thread.ownerId ?? 'unknown',
+            created: thread.createdAt?.toISOString() ?? 'unknown',
+            archived: thread.archived ?? false,
+            locked: thread.locked ?? false,
+            messageCount: thread.messageCount ?? 0,
+            tags,
+            body: starter?.content ?? '',
+            ...(starter?.embeds && starter.embeds.length > 0 && {
+              embeds: starter.embeds.map(e => ({
+                ...(e.title && { title: e.title }),
+                ...(e.description && { description: e.description }),
+                ...(e.fields.length > 0 && { fields: e.fields.map(f => ({ name: f.name, value: f.value })) }),
+              })),
+            }),
+            ...(starter?.attachments && starter.attachments.size > 0 && {
+              attachments: Array.from(starter.attachments.values()).map(a => a.url),
+            }),
+          };
+        }));
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              forum: `#${forum.name}`,
+              server: forum.guild.name,
+              postCount: formattedPosts.length,
+              posts: formattedPosts,
+            }, null, 2),
+          }],
+        };
+      }
+
+      case "read-forum-post": {
+        const { thread_id, server: srv, limit } = ReadForumPostSchema.parse(args);
+        const guild = await findGuild(srv);
+
+        const thread = await client.channels.fetch(thread_id);
+        if (!thread || !thread.isThread()) {
+          throw new Error(`Thread "${thread_id}" not found or is not a thread/forum post`);
+        }
+        if (thread.guild?.id !== guild.id) {
+          throw new Error(`Thread "${thread_id}" does not belong to server "${guild.name}"`);
+        }
+
+        const messages = await thread.messages.fetch({ limit });
+        const sorted = Array.from(messages.values()).sort(
+          (a, b) => a.createdTimestamp - b.createdTimestamp
+        );
+
+        const formattedMessages = sorted.map(msg => ({
+          author: msg.author.tag,
+          content: msg.content,
+          timestamp: msg.createdAt.toISOString(),
+          ...(msg.embeds.length > 0 && {
+            embeds: msg.embeds.map(e => ({
+              ...(e.title && { title: e.title }),
+              ...(e.description && { description: e.description }),
+              ...(e.fields.length > 0 && { fields: e.fields.map(f => ({ name: f.name, value: f.value })) }),
+            })),
+          }),
+          ...(msg.attachments.size > 0 && {
+            attachments: Array.from(msg.attachments.values()).map(a => a.url),
+          }),
+        }));
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              thread: thread.name,
+              forum: thread.parent ? `#${thread.parent.name}` : 'unknown',
+              server: thread.guild.name,
+              messages: formattedMessages,
+            }, null, 2),
           }],
         };
       }
